@@ -235,7 +235,7 @@ model_unet = UNet(in_channels=3, out_channels=1).to(device)
 optimizer = optim.Adam(model_unet.parameters(), lr=1e-4)
 bce_fn = nn.BCEWithLogitsLoss()
 
-num_epochs = 25
+num_epochs = 15
 train_losses = []
 val_losses = []
 best_val_loss = float('inf')
