@@ -1,5 +1,5 @@
 # --- Setup Environment ---
-!pip install -q ultralytics kagglehub
+
 import kagglehub
 import os
 import shutil
@@ -20,19 +20,39 @@ from tqdm import tqdm
 import time
 
 # --- Download and Extract Data ---
-# Download latest version of Oxford-IIIT Pet dataset
-path = kagglehub.dataset_download("tanlikesmath/the-oxfordiiit-pet-dataset")
-print("Path to dataset files:", path)
-
 dataset_dir = './dataset'
-if not os.path.exists(dataset_dir):
-    shutil.copytree(path, dataset_dir)
-print("Data copied to", dataset_dir)
+os.makedirs(dataset_dir, exist_ok=True)
+
+images_url = "https://www.robots.ox.ac.uk/~vgg/data/pets/data/images.tar.gz"
+annotations_url = "https://www.robots.ox.ac.uk/~vgg/data/pets/data/annotations.tar.gz"
+
+if not os.path.exists(os.path.join(dataset_dir, 'images')):
+    print("Downloading images...")
+    os.system(f"wget -q {images_url} -O images.tar.gz")
+    print("Extracting images...")
+    os.system(f"tar -xf images.tar.gz -C {dataset_dir}")
+
+if not os.path.exists(os.path.join(dataset_dir, 'annotations')):
+    print("Downloading annotations...")
+    os.system(f"wget -q {annotations_url} -O annotations.tar.gz")
+    print("Extracting annotations...")
+    os.system(f"tar -xf annotations.tar.gz -C {dataset_dir}")
+
+print("Dataset ready at", dataset_dir)
 
 # --- Data Preprocessing (Train/Val/Test Split & YOLO format) ---
-images_dir = os.path.join(dataset_dir, 'images/images')
-annotations_dir = os.path.join(dataset_dir, 'annotations/annotations/xmls')
-trimaps_dir = os.path.join(dataset_dir, 'annotations/annotations/trimaps')
+# Robustly find the required directories
+images_dir, annotations_dir, trimaps_dir = None, None, None
+for root, dirs, files in os.walk(dataset_dir):
+    if any(f.endswith('.jpg') for f in files):
+        images_dir = root
+    if any(f.endswith('.xml') for f in files):
+        annotations_dir = root
+    if any(f.endswith('.png') for f in files):
+        trimaps_dir = root
+
+if not all([images_dir, annotations_dir, trimaps_dir]):
+    raise FileNotFoundError(f"Could not find all directories! Images: {images_dir}, XMLs: {annotations_dir}, Trimaps: {trimaps_dir}")
 
 # Get list of valid images that have annotations
 all_images = [f for f in os.listdir(images_dir) if f.endswith('.jpg')]
@@ -95,7 +115,7 @@ for split_name, split_list in zip(['train', 'val', 'test'], [train_samples, val_
             with open(label_path, 'w') as f:
                 f.write(f"{yolo_anno[0]} {yolo_anno[1]:.6f} {yolo_anno[2]:.6f} {yolo_anno[3]:.6f} {yolo_anno[4]:.6f}\n")
         except Exception as e:
-            pass # Skip sample entirely to avoid empty labels
+            print(f"Skipping {base_name}: {e}")
 
 yaml_content = f"""
 path: {os.path.abspath(yolo_base_dir)}
@@ -117,7 +137,10 @@ results = model.train(
     epochs=10, 
     imgsz=640,
     batch=16,
-    name='pet_yolo_model'
+    name='pet_yolo_model',
+    project='runs/detect',
+    device=0,
+    workers=4
 )
 
 metrics = model.val()
@@ -204,7 +227,7 @@ class PetDataset(Dataset):
         image = Image.open(img_path).convert("RGB")
         mask = Image.open(mask_path)
         mask = np.array(mask)
-        binary_mask = (mask == 1).astype(np.float32)
+        binary_mask = (mask != 2).astype(np.float32)  # 1=Foreground, 3=Border. 2 is Background.
 
         if self.transform:
             image = self.transform(image)
@@ -227,8 +250,14 @@ val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
 
 def dice_loss(pred, target, smooth=1.):
     pred = torch.sigmoid(pred)
-    intersection = (pred * target).sum()
-    return 1 - ((2. * intersection + smooth) / (pred.sum() + target.sum() + smooth))
+    pred = pred.contiguous()
+    target = target.contiguous()
+
+    intersection = (pred * target).sum(dim=(2,3))
+    union = pred.sum(dim=(2,3)) + target.sum(dim=(2,3))
+
+    dice = (2. * intersection + smooth) / (union + smooth)
+    return 1 - dice.mean()
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model_unet = UNet(in_channels=3, out_channels=1).to(device)
@@ -378,6 +407,19 @@ unet_time = (end_unet - start_unet) * 1000 # in ms
 
 print(f"YOLOv11 Inference Time: {yolo_time:.2f} ms")
 print(f"U-Net Inference Time:   {unet_time:.2f} ms\n")
+
+# --- YOLOv11 PR Curve ---
+print("\n--- YOLOv11 PR Curve ---")
+pr_curve_path = os.path.join('runs', 'detect', 'pet_yolo_model', 'PR_curve.png')
+if os.path.exists(pr_curve_path):
+    plt.figure(figsize=(10, 8))
+    pr_img = Image.open(pr_curve_path)
+    plt.imshow(np.array(pr_img))
+    plt.axis('off')
+    plt.title('YOLOv11 Precision-Recall Curve')
+    plt.show()
+else:
+    print(f"PR curve not found at {pr_curve_path}")
 
 # --- Side-by-Side Visual Comparison ---
 def unnormalize(tensor):
